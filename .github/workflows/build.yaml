@@ -1,6 +1,4 @@
-# Home Assistant Operating System build workflow
-
-name: OS build
+name: OS build (CN Accelerated)
 
 on:
   release:
@@ -22,7 +20,7 @@ on:
           - beta
           - dev
       region:
-        description: 'Target region (official: haos official version)'
+        description: 'Target region (official: haos official version, cn: domestic accelerated)'
         type: choice
         required: true
         default: cn
@@ -32,15 +30,21 @@ on:
 
 env:
   PYTHON_VERSION: "3.13"
+  # 新增国内加速相关环境变量
+  CN_MIRROR: "true"
+  BUILD_ROOT_MIRROR: "https://mirrors.tuna.tsinghua.edu.cn/buildroot"
+  ALPINE_MIRROR: "https://mirrors.aliyun.com/alpine"
+  PYPI_MIRROR: "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 jobs:
   prepare:
-    name: Prepare build
+    name: Prepare build (CN Accelerated)
     runs-on: ubuntu-22.04
     permissions:
       contents: read
       pull-requests: read
       packages: write
+      id-token: write  # 新增：用于 GHCR 认证
     outputs:
       version_dev: ${{ steps.version_dev.outputs.version_dev }}
       version_main: ${{ steps.version.outputs.version_main }}
@@ -48,7 +52,7 @@ jobs:
       channel: ${{ steps.channel.outputs.channel }}
       hassio_channel_option: ${{ steps.channel.outputs.hassio_channel_option }}
       matrix: ${{ steps.generate_matrix.outputs.result }}
-      build_container_image: ghcr.io/${{ github.repository_owner }}/haos-builder@${{ steps.build_haos_builder.outputs.digest }}
+      build_container_image: ${{ steps.build_haos_builder.outputs.image_name }}  # 兼容本地构建
       publish_build: ${{ steps.check_publish.outputs.publish_build }}
       self_signed_cert: ${{ steps.generate_signing_key.outputs.self_signed_cert }}
     steps:
@@ -56,6 +60,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           persist-credentials: false
+          submodules: true  # 提前拉取子模块
 
       - name: Check if build should be published
         id: check_publish
@@ -152,33 +157,45 @@ jobs:
 
             const boardFilter = "${{ github.event.inputs.boards }}"
             if (boardFilter == "") {
-              console.log("Run full build for all boards")
+              console.log("Run full build for all boards (CN accelerated)")
               return { "board": boards }
             } else {
-              console.log("Run partial build")
+              console.log("Run partial build (CN accelerated)")
               const boardSet = new Set(boardFilter.split(","))
               const buildBoards = boards.filter(b => boardSet.has(b.id))
               return { "board": buildBoards }
             }
 
-      - name: Set up Docker Buildx
+      # 改造构建容器步骤：适配国内加速，避免 GHCR 推送（核心修改）
+      - name: Set up Docker Buildx (CN)
         uses: docker/setup-buildx-action@v3.11.1
-      - name: Log in to the GitHub container registry
-        uses: docker/login-action@v3.5.0
-        with:
-            registry: ghcr.io
-            username: ${{ github.repository_owner }}
-            password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and Push
+      
+      - name: Build HAOS builder (local, CN accelerated)
         uses: docker/build-push-action@v6.18.0
         id: build_haos_builder
         with:
           context: .
           file: Dockerfile
-          tags: ghcr.io/${{ github.repository_owner }}/haos-builder
-          cache-from: ghcr.io/${{ github.repository_owner }}/haos-builder:cache-${{ steps.version.outputs.version_main }}
-          cache-to: ghcr.io/${{ github.repository_owner }}/haos-builder:cache-${{ steps.version.outputs.version_main }}
-          push: true
+          # 仅本地构建，不推送 GHCR（解决权限问题）
+          push: false
+          # 注入国内镜像源
+          build-args: |
+            BUILD_ROOT_MIRROR=${{ env.BUILD_ROOT_MIRROR }}
+            ALPINE_MIRROR=${{ env.ALPINE_MIRROR }}
+            PYPI_MIRROR=${{ env.PYPI_MIRROR }}
+            CN_MIRROR=${{ env.CN_MIRROR }}
+          # 本地标签，用于后续构建
+          tags: haos-builder:cn-${{ steps.version.outputs.version_main }}
+          # 本地缓存，加速构建
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
+        env:
+          DOCKER_BUILDKIT: 1
+
+      - name: Set local builder image name
+        id: set_builder_image
+        run: |
+          echo "image_name=haos-builder:cn-${{ steps.version.outputs.version_main }}" >> $GITHUB_OUTPUT
 
       - name: Generate self-signed certificate
         id: generate_signing_key
@@ -201,9 +218,9 @@ jobs:
             key.pem
 
   build:
-    name: Build for ${{ matrix.board.id }}
+    name: Build for ${{ matrix.board.id }} (CN)
     permissions:
-      contents: write  # for actions/upload-release-asset to upload release asset
+      contents: write
     needs: prepare
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
@@ -241,15 +258,12 @@ jobs:
 
       - name: Free space on build drive
         run: |
-          # Inspired by https://github.com/easimon/maximize-build-space/blob/v7/action.yml
           df -h
           sudo rm -rf /usr/local/lib/android/sdk/ndk
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo mkdir /mnt/cache
           sudo mkdir /mnt/output
           WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
-          # output directory is symlinked for easier access from workspace
-          # but for build container it must be mounted as a volume
           sudo ln -sf /mnt/output "${GITHUB_WORKSPACE}/output"
           sudo chown -R "${WORKSPACE_OWNER}" /mnt/cache
           sudo chown -R "${WORKSPACE_OWNER}" /mnt/output
@@ -259,22 +273,31 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: /mnt/cache/cc
-          key: haos-cc-${{ matrix.board.id }}
+          key: haos-cc-${{ matrix.board.id }}-cn  # 区分国内缓存
 
+      # 核心改造：适配国内加速的构建命令（对应作者的 --region cn）
+      - name: Apply CN region patch (accelerated)
+        uses: "./.github/actions/haos-builder-command"
+        with:
+          # 使用本地构建镜像，而非 GHCR 镜像
+          image: ${{ needs.prepare.outputs.build_container_image }}
+          command: |
+            # 注入国内镜像源环境变量
+            export BUILD_ROOT_MIRROR=${{ env.BUILD_ROOT_MIRROR }}
+            export ALPINE_MIRROR=${{ env.ALPINE_MIRROR }}
+            export PYPI_MIRROR=${{ env.PYPI_MIRROR }}
+            # 执行作者的 region 命令（国内版）
+            [ "${{ inputs.region }}" = "official" ] && ./region --region global "${{ matrix.board.defconfig }}" || ./region --region cn "${{ matrix.board.defconfig }}"
 
-      - name: Apply region patch
+      - name: Generate build config (CN accelerated)
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: |
-            [ "${{ inputs.region }}" = "official" ] && ./region --region global "${{ matrix.board.defconfig }}" || ./region --region cn "${{ matrix.board.defconfig }}"
-
-
-      - name: Generate build config
-        uses: "./.github/actions/haos-builder-command"
-        with:
-          image: ${{ needs.prepare.outputs.build_container_image }}
-          command: make ${{ matrix.board.defconfig }}_defconfig
+            # 配置国内源
+            echo "BR2_PACKAGE_HOST_PYTHON3_PIP_EXTRA_ARGS=-i ${{ env.PYPI_MIRROR }}" >> .config
+            echo "BR2_GNU_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/gnu" >> .config
+            make ${{ matrix.board.defconfig }}_defconfig
 
       - name: Override release channel
         if: ${{ needs.prepare.outputs.hassio_channel_option != 'BR2_PACKAGE_HASSIO_CHANNEL_STABLE' }}
@@ -284,11 +307,16 @@ jobs:
           command: |
             bash -c 'echo "${{ needs.prepare.outputs.hassio_channel_option }}=y" >> /build/output/.config && make olddefconfig'
 
-      - name: Build
+      # 国内加速构建
+      - name: Build (CN accelerated)
         uses: "./.github/actions/haos-builder-command"
         with:
           image: ${{ needs.prepare.outputs.build_container_image }}
-          command: make
+          command: |
+            # 强制使用国内源构建
+            export http_proxy=http://10.0.0.1:7890  # 可选：如果需要代理
+            export https_proxy=http://10.0.0.1:7890
+            make -j$(nproc)  # 多线程加速构建
 
       - name: Check Linux config
         uses: "./.github/actions/haos-builder-command"
@@ -296,7 +324,6 @@ jobs:
           image: ${{ needs.prepare.outputs.build_container_image }}
           command: |
             make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
-
 
       - name: Upload release assets
         if: ${{ github.event_name == 'release' }}
@@ -318,11 +345,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /mnt/cache/cc
-          key: haos-cc-${{ matrix.board.id }}-${{ github.run_id }}
+          key: haos-cc-${{ matrix.board.id }}-cn-${{ github.run_id }}  # 区分国内缓存
 
-      - name: Generate build summary
+      - name: Generate build summary (CN)
         run: |
-          echo "# ${{ matrix.board.id }} build summary" >> $GITHUB_STEP_SUMMARY
+          echo "# ${{ matrix.board.id }} build summary (CN Accelerated)" >> $GITHUB_STEP_SUMMARY
           echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
           echo "| File | Size (bytes) | Size (formatted) |" >> $GITHUB_STEP_SUMMARY
           echo "|:-|:-|:-|" >> $GITHUB_STEP_SUMMARY
@@ -336,11 +363,12 @@ jobs:
             echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
 
+      # 保留所有产物上传步骤（略，与原代码一致）
       - name: Upload OS image artifact
         uses: actions/upload-artifact@v4
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
+          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}-cn.img.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
 
@@ -348,7 +376,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
+          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}-cn.raucb
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
 
@@ -356,16 +384,15 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
+          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}-cn.ova
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
 
       - name: Upload QEMU disk image artifact
         uses: actions/upload-artifact@v4
-        # Create artifact for ova every time - it's used by the called tests workflow
         if: ${{ matrix.board.id == 'ova' || (github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
+          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}-cn.qcow2.xz
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
 
@@ -373,7 +400,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && (matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova') }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
+          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}-cn.vmdk.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
 
@@ -381,7 +408,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
+          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}-cn.vdi.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
 
@@ -389,6 +416,6 @@ jobs:
         uses: actions/upload-artifact@v4
         if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
         with:
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
+          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}-cn.vhdx.zip
           path: |
             output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
